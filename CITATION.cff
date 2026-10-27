@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: "MoRE-GS: Motion-Regime Experts for Future Gaussian Splatting"
+message: "If you use this software, please cite the associated WACV 2027 paper."
+type: software
+authors:
+  - family-names: Salehi
+    given-names: Shima
+    email: shima.salehi@tamu.edu
+  - family-names: Peeples
+    given-names: Joshua
+    email: jpeeples@tamu.edu
+version: 1.0.0
+repository-code: "https://github.com/advanced-vision-and-learning-lab/MoRE-GS"
+url: "https://advanced-vision-and-learning-lab.github.io/MoRE-GS-website/"
+license: LicenseRef-Gaussian-Splatting-Research
+preferred-citation:
+  type: conference-paper
+  title: "MoRE-GS: Motion-Regime Experts for Future Gaussian Splatting"
+  authors:
+    - family-names: Salehi
+      given-names: Shima
+    - family-names: Peeples
+      given-names: Joshua
+  collection-title: "Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision"
+  year: 2027

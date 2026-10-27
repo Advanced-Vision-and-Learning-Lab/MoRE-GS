@@ -1,0 +1,37 @@
+{
+  "protocol": {
+    "observed_fraction": 0.8,
+    "fit_fraction_within_observed": 0.75,
+    "sequence_length": 10,
+    "canonical_seed": 42
+  },
+  "canonical": {
+    "iterations": 60000,
+    "max_points": 100,
+    "adaptive_points_num": 100,
+    "time_freq": 6,
+    "nearest_num": 6,
+    "feature_amplify": 0.5
+  },
+  "experts": {
+    "updates": 2001,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "hidden": 32,
+    "attention_heads": 8,
+    "feedforward": 64,
+    "dropout": 0.2,
+    "structured_hard_groups": 8
+  },
+  "router": {
+    "soft_groups": 16,
+    "horizon_bins": 4,
+    "temperature": 0.18,
+    "updates": 200,
+    "learning_rate": 0.05,
+    "smoothness_weight": 0.002,
+    "moving_mass_weight": 0.0001,
+    "entropy_weight": 0.0001
+  }
+}
+

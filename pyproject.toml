@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "more-gs"
+version = "1.0.0"
+description = "Causal motion-regime expert routing for dynamic Gaussian forecasting"
+requires-python = ">=3.7"
+license = {file = "LICENSE.md"}
+authors = [
+  {name = "Shima Salehi", email = "shima.salehi@tamu.edu"},
+  {name = "Joshua Peeples", email = "jpeeples@tamu.edu"},
+]
+
+[tool.setuptools]
+packages = ["moregs"]
+

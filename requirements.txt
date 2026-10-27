@@ -1,0 +1,19 @@
+# Install the pinned GaussianPrediction backbone first. Its compiled CUDA
+# dependencies cannot be installed reliably from this file alone.
+numpy==1.21.5
+trimesh==4.0.5
+plyfile==0.8.1
+tqdm==4.67.3
+tensorboard==2.11.2
+prettytable==3.7.0
+open3d==0.17.0
+einops==0.6.1
+kmeans_pytorch==0.3
+opencv_python==4.13.0.92
+pytorch_msssim==1.0.0
+imageio==2.31.2
+scikit-learn==1.0.2
+lpips==0.1.4
+Pillow==9.4.0
+# Install torch-scatter and the CUDA extensions through the pinned
+# GaussianPrediction setup after creating environment.yml.

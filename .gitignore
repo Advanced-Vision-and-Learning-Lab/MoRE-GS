@@ -1,0 +1,39 @@
+# Datasets and external repositories
+data/
+datasets/
+external/gaussian_prediction/
+
+# Trained artifacts and generated outputs
+output/
+outputs/
+checkpoints/
+runs/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+
+# Local environments and caches
+.venv/
+.conda/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.cache/
+.locks/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Site and packaging output
+site-preview/
+*.zip
+*.tar.gz
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/

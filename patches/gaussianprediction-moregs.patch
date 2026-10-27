@@ -1,0 +1,1364 @@
+diff --git a/eval.py b/eval.py
+index 4c4614b..98874c3 100644
+--- a/eval.py
++++ b/eval.py
+@@ -16,6 +16,7 @@ import numpy as np
+ from scene import Scene
+ import os
+ import time
++import json
+ import cv2
+ from os import makedirs
+ from gaussian_renderer import render
+@@ -35,6 +36,76 @@ from utils.prepare.makeVideo import make_video
+ from options.gaussian_option import Gaussian_Options
+ from tqdm import tqdm
+ 
++
++def _phase160_profile_render_kpts(views, gaussians, pipeline, background,
++                                  kpts, kpts_rotation, weights_xyz, weights_r,
++                                  life_opacity):
++    """Profile frozen dense mapping and rasterization without saving images."""
++    output_path = os.environ.get("PHASE160_PROFILE_JSON")
++    if not output_path:
++        return
++    if gaussians.compact_nearest is not None:
++        raise RuntimeError("Phase160 renderer factorial requires matched dense bindings")
++
++    warmup = int(os.environ.get("PHASE160_WARMUP", "5"))
++    repeats = int(os.environ.get("PHASE160_REPEATS", "3"))
++    gaussian_xyz = gaussians.get_xyz
++    gaussian_kpts = gaussians.super_gaussians
++
++    def run_frame(frame_index, record=False):
++        mapping_start = torch.cuda.Event(enable_timing=True) if record else None
++        mapping_stop = torch.cuda.Event(enable_timing=True) if record else None
++        raster_stop = torch.cuda.Event(enable_timing=True) if record else None
++        if record:
++            mapping_start.record()
++        xyz_final = gaussian_xyz + (
++            weights_xyz @ (kpts[frame_index] - gaussian_kpts)
++        )
++        blended_rotation = weights_r @ kpts_rotation[frame_index]
++        delta_r = gaussians.get_rotation_(
++            gaussians.rotation_activation(blended_rotation)
++        )
++        if record:
++            mapping_stop.record()
++        render_motion(
++            views[frame_index], gaussians, pipeline, background,
++            xyz_t=xyz_final, r_t=delta_r, opacity=life_opacity,
++        )
++        if record:
++            raster_stop.record()
++            return mapping_start, mapping_stop, raster_stop
++
++    for index in range(warmup):
++        run_frame(index % len(kpts), record=False)
++    torch.cuda.synchronize()
++
++    events = []
++    torch.cuda.synchronize()
++    wall_start = time.time()
++    for _ in range(repeats):
++        for index in range(len(kpts)):
++            events.append(run_frame(index, record=True))
++    torch.cuda.synchronize()
++    wall_seconds = time.time() - wall_start
++
++    mapping_ms = [start.elapsed_time(stop) for start, stop, _ in events]
++    raster_ms = [stop.elapsed_time(end) for _, stop, end in events]
++    complete_ms = [start.elapsed_time(end) for start, _, end in events]
++    count = len(events)
++    payload = {
++        "warmup_frames": warmup,
++        "profile_frames": count,
++        "mapping_gpu_ms_mean": float(np.mean(mapping_ms)),
++        "raster_gpu_ms_mean": float(np.mean(raster_ms)),
++        "complete_gpu_ms_mean": float(np.mean(complete_ms)),
++        "batched_wall_seconds": wall_seconds,
++        "batched_end_to_end_fps": count / wall_seconds,
++    }
++    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
++    with open(output_path, "w") as handle:
++        json.dump(payload, handle, indent=2)
++    print("PHASE160_PROFILE " + json.dumps(payload, sort_keys=True))
++
+ def project_trajectory(gaussians, view, tidx, time_freq, iteration, steps=60):
+     H, W = tidx.shape[0], tidx.shape[1]
+     image = np.zeros([H, W, 3], dtype=np.float32)
+@@ -122,10 +193,26 @@ def render_kpts(model_path, exp_name, name, iteration, views, gaussians, pipelin
+     eval_path = os.path.join(model_path, exp_name, name)
+     render_path = os.path.join(eval_path, "ours_{}".format(iteration), "renders")
+     
++    torch.cuda.synchronize()
++    setup_started = time.time()
+     time_ = torch.from_numpy(views[0].time).to(torch.float32).cuda()
+-    _, _, _, _, weights_xyz, weights_r = gaussians(time_, iteration, return_weights=True)
++    compact = gaussians.compact_nearest is not None
++    if compact:
++        gaussians(time_, iteration, return_weights=False)
++        nearest = gaussians.compact_nearest
++        weights_xyz = gaussians.compact_weights_xyz
++        weights_r = gaussians.compact_weights_r
++    else:
++        _, _, _, _, weights_xyz, weights_r = gaussians(time_, iteration, return_weights=True)
++    torch.cuda.synchronize()
++    setup_seconds = time.time() - setup_started
+     life_opacity = gaussians.lifecycle_opacity
+ 
++    _phase160_profile_render_kpts(
++        views, gaussians, pipeline, background, kpts, kpts_rotation,
++        weights_xyz, weights_r, life_opacity,
++    )
++
+     if view_id is not None:
+         render_path = os.path.join(render_path, f"view{view_id}")
+     makedirs(render_path, exist_ok=True)
+@@ -134,11 +221,23 @@ def render_kpts(model_path, exp_name, name, iteration, views, gaussians, pipelin
+         gts_path = os.path.join(eval_path, "ours_{}".format(iteration), "gt")
+         makedirs(gts_path, exist_ok=True)
+ 
+-    for i in tqdm(range(len(kpts))):
++    render_seconds = 0.0
++    frame_limit = int(os.environ.get("PHASE160_FRAME_LIMIT", str(len(kpts))))
++    rendered_frames = min(len(kpts), frame_limit)
++    for i in tqdm(range(rendered_frames)):
++        torch.cuda.synchronize()
++        render_started = time.time()
+         gaussian_xyz, gaussian_kpts = gaussians.get_xyz, gaussians.super_gaussians
+ 
+-        xyz_final = gaussian_xyz + (weights_xyz @ (kpts[i] - gaussian_kpts))
+-        delta_r = gaussians.get_rotation_(gaussians.rotation_activation(weights_r @ kpts_rotation[i]))
++        if compact:
++            local_xyz = kpts[i][nearest] - gaussian_kpts[nearest]
++            local_rotation = kpts_rotation[i][nearest]
++            xyz_final = gaussian_xyz + torch.sum(weights_xyz.unsqueeze(-1) * local_xyz, dim=1)
++            blended_rotation = torch.sum(weights_r.unsqueeze(-1) * local_rotation, dim=1)
++        else:
++            xyz_final = gaussian_xyz + (weights_xyz @ (kpts[i] - gaussian_kpts))
++            blended_rotation = weights_r @ kpts_rotation[i]
++        delta_r = gaussians.get_rotation_(gaussians.rotation_activation(blended_rotation))
+ 
+         if metrics:
+             view = views[i]
+@@ -151,9 +250,35 @@ def render_kpts(model_path, exp_name, name, iteration, views, gaussians, pipelin
+             view = views[(id % (len(views) // 2)) * position]
+ 
+         render_pkg = render_motion(view, gaussians, pipeline, background, xyz_t=xyz_final, r_t=delta_r, opacity=life_opacity)
++        torch.cuda.synchronize()
++        render_seconds += time.time() - render_started
++        if os.environ.get("PHASE160_TILE_COUNTS"):
++            import diff_gaussian_rasterization as raster_backend
++            count_fn = getattr(raster_backend, "get_last_num_rendered", None)
++            if count_fn is not None:
++                print("PHASE160_TILES frame={} instances={}".format(i, count_fn()))
+         rendering = render_pkg["render"]
++        capture_dir = os.environ.get("PHASE160_CAPTURE_FLOAT_DIR")
++        reference_dir = os.environ.get("PHASE160_REFERENCE_FLOAT_DIR")
++        if capture_dir:
++            os.makedirs(capture_dir, exist_ok=True)
++            torch.save(
++                rendering.detach().cpu(),
++                os.path.join(capture_dir, "{0:05d}.pt".format(i)),
++            )
++        if reference_dir:
++            reference = torch.load(
++                os.path.join(reference_dir, "{0:05d}.pt".format(i)),
++                map_location="cpu",
++            )
++            error = torch.max(torch.abs(rendering.detach().cpu() - reference)).item()
++            print("PHASE160_PIXEL frame={} max_abs={:.9g}".format(i, error))
+         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(i) + ".png"))
+ 
++    if rendered_frames > 0:
++        complete_seconds = setup_seconds + render_seconds
++        print(f"Forecast rendering AVG Times: {complete_seconds / rendered_frames:.5f}, FPS: {rendered_frames / complete_seconds:.5f}")
++        print(f"Forecast binding setup seconds: {setup_seconds:.5f}")
+     return eval_path, render_path
+ 
+ def render_trainSequence(model_path, name, iteration, train_views, gaussians, pipeline, background, opt, args, test_views, freeze_view_number=5):
+@@ -170,6 +295,8 @@ def render_trainSequence(model_path, name, iteration, train_views, gaussians, pi
+         if isinstance(view, dict): # Use optical flow
+             view = view["cam"]
+         time_ = torch.from_numpy(view.time).to(torch.float32).cuda()
++        if args.eval_motion_time is not None:
++            time_ = torch.full_like(time_, float(args.eval_motion_time))
+         
+         start_time = time.time()
+         torch.cuda.synchronize()
+@@ -189,8 +316,59 @@ def render_trainSequence(model_path, name, iteration, train_views, gaussians, pi
+     fps_avg = 1. / time_avg
+     print(f"Rendering AVG Times: {time_avg:.5f}, FPS: {fps_avg:.5f}")
+ 
++
++def _phase160_profile_render_set(views, gaussians, pipeline, background,
++                                 iteration):
++    """Profile the complete deformation-plus-raster path without image I/O."""
++    output_path = os.environ.get("PHASE160_PROFILE_JSON")
++    if not output_path:
++        return
++    warmup = int(os.environ.get("PHASE160_WARMUP", "5"))
++    repeats = int(os.environ.get("PHASE160_REPEATS", "3"))
++
++    def run_frame(index, record=False):
++        view = views[index]
++        if isinstance(view, dict):
++            view = view["cam"]
++        time_value = torch.from_numpy(view.time).to(torch.float32).cuda()
++        start = torch.cuda.Event(enable_timing=True) if record else None
++        stop = torch.cuda.Event(enable_timing=True) if record else None
++        if record:
++            start.record()
++        render(
++            view, gaussians, pipeline, background,
++            delta=None, time=time_value, it=iteration,
++        )
++        if record:
++            stop.record()
++            return start, stop
++
++    for index in range(warmup):
++        run_frame(index % len(views), record=False)
++    torch.cuda.synchronize()
++    events = []
++    wall_start = time.time()
++    for _ in range(repeats):
++        for index in range(len(views)):
++            events.append(run_frame(index, record=True))
++    torch.cuda.synchronize()
++    wall_seconds = time.time() - wall_start
++    complete_ms = [start.elapsed_time(stop) for start, stop in events]
++    count = len(events)
++    payload = {
++        "warmup_frames": warmup,
++        "profile_frames": count,
++        "complete_mapping_raster_gpu_ms_mean": float(np.mean(complete_ms)),
++        "batched_wall_seconds": wall_seconds,
++        "batched_mapping_raster_fps": count / wall_seconds,
++    }
++    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
++    with open(output_path, "w") as handle:
++        json.dump(payload, handle, indent=2)
++    print("PHASE160_PROFILE " + json.dumps(payload, sort_keys=True))
++
+ def render_set(model_path, name, iteration, views, gaussians, pipeline, background, opt, args):
+-    eval_path = os.path.join(model_path, "eval", name)
++    eval_path = os.path.join(model_path, args.eval_tag, name)
+     render_path = os.path.join(eval_path, "ours_{}".format(iteration), "renders")
+     gts_path = os.path.join(eval_path, "ours_{}".format(iteration), "gt")
+ 
+@@ -201,11 +379,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
+     if args.adaptive_points_num > 0:
+         np.savetxt(os.path.join(model_path, "kpts_incre.txt"), gaussians.get_superGaussians[args.max_points:].detach().cpu().numpy())
+ 
++    _phase160_profile_render_set(
++        views, gaussians, pipeline, background, iteration,
++    )
++
+     time_avg = 0.
+     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+         if isinstance(view, dict): # Use optical flow
+             view = view["cam"]
+         time_ = torch.from_numpy(view.time).to(torch.float32).cuda()
++        if args.eval_motion_time is not None:
++            time_ = torch.full_like(time_, float(args.eval_motion_time))
+ 
+         start_time = time.time()
+         torch.cuda.synchronize()
+@@ -214,6 +398,21 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
+         end_time = time.time()
+         time_avg += end_time - start_time
+         rendering = render_pkg["render"]
++        capture_dir = os.environ.get("PHASE160_CAPTURE_FLOAT_DIR")
++        reference_dir = os.environ.get("PHASE160_REFERENCE_FLOAT_DIR")
++        if capture_dir:
++            os.makedirs(capture_dir, exist_ok=True)
++            torch.save(
++                rendering.detach().cpu(),
++                os.path.join(capture_dir, "{0:05d}.pt".format(idx)),
++            )
++        if reference_dir:
++            reference = torch.load(
++                os.path.join(reference_dir, "{0:05d}.pt".format(idx)),
++                map_location="cpu",
++            )
++            error = torch.max(torch.abs(rendering.detach().cpu() - reference)).item()
++            print("PHASE160_PIXEL frame={} max_abs={:.9g}".format(idx, error))
+         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+ 
+         gt = view.original_image[0:3, :, :]
+@@ -223,26 +422,85 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
+     fps_avg = 1. / time_avg
+     print(f"Rendering AVG Times: {time_avg:.5f}, FPS: {fps_avg:.5f}")
+ 
+-    return eval_path
++    if args.profile_resources:
++        print(f"PROFILE render_peak_bytes={torch.cuda.max_memory_allocated()}")
++    return eval_path, fps_avg
+ 
+ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int, pipeline : PipelineParams, ckpt_iteration : int, args):
+     with torch.no_grad():
++        if args.profile_resources:
++            torch.cuda.reset_peak_memory_stats()
+         xyz_freq = opt.xyz_freq
+         time_freq = opt.time_freq
+ 
+         time_input_dim = 2 * time_freq
+         xyz_input_dim = 6 * xyz_freq
+ 
++        compact_payload = None
++        compact_checkpoint = getattr(args, "compact_checkpoint", None)
++        compile_compact_checkpoint = getattr(args, "compile_compact_checkpoint", None)
++        if compact_checkpoint is not None:
++            compact_payload = torch.load(compact_checkpoint, map_location="cpu")
++            if compact_payload.get("format") != "gp_compiled_sparse_v1":
++                raise RuntimeError("Unsupported compact checkpoint format")
++            model_params = compact_payload["model_state"]
++            first_iter = int(compact_payload["iteration"])
++            args.compact_inference = True
++        else:
++            model_params, opt_dict, first_iter = torch.load(
++                os.path.join(dataset.model_path, f"chkpnt{ckpt_iteration:d}.pth")
++            )
++
+         gaussians = GaussianModel(dataset.sh_degree, args)
+         gaussians.set_inputDim(time_input_dim, xyz_input_dim)
+-        (model_params, opt_dict, first_iter) = torch.load(os.path.join(dataset.model_path, f"chkpnt{ckpt_iteration:d}.pth"))
+         gaussians.N_pcd_init = model_params["_xyz"].shape[0]
+         gaussians.active_sh_degree = gaussians.max_sh_degree
+         gaussians.final_kpts_num = model_params["super_gaussians"].shape[0] if "super_gaussians" in model_params.keys() else None
+         
+         scene = Scene(dataset, gaussians, shuffle=False, ratio=args.ratio)
+-        gaussians.restore(opt_dict, opt, first_iter)
+-        gaussians.load_state_dict(model_params, strict=False)
++        if compact_payload is None and compile_compact_checkpoint is None:
++            # Preserve the released evaluation path for baseline reproduction.
++            gaussians.restore(opt_dict, opt, first_iter)
++            gaussians.load_state_dict(model_params, strict=False)
++        else:
++            gaussians.inference_setup(first_iter)
++            incompatible = gaussians.load_state_dict(model_params, strict=False)
++            unexpected = [name for name in incompatible.unexpected_keys if name != "weights_fill"]
++            if unexpected:
++                raise RuntimeError(f"Unexpected compact state keys: {unexpected}")
++
++        if compile_compact_checkpoint is not None:
++            gaussians.compile_sparse_bindings()
++            output_dir = os.path.dirname(os.path.abspath(compile_compact_checkpoint))
++            os.makedirs(output_dir, exist_ok=True)
++            payload = {
++                "format": "gp_compiled_sparse_v1",
++                "iteration": int(first_iter),
++                "model_state": gaussians.compact_state_dict(),
++                "bindings": gaussians.sparse_bindings_state(),
++                "nearest_num": int(args.nearest_num),
++                "step_opacity": bool(args.step_opacity),
++            }
++            torch.save(payload, compile_compact_checkpoint)
++            print(f"Saved compiled sparse checkpoint: {compile_compact_checkpoint}")
++            return
++
++        if compact_payload is not None:
++            gaussians.load_sparse_bindings(compact_payload["bindings"])
++
++        if args.eval_gaussian_scale <= 0.0:
++            raise ValueError("--eval_gaussian_scale must be positive")
++        if args.eval_gaussian_scale != 1.0:
++            # The stored parameter is log scale.  Calibration is performed on
++            # the last revealed timestamp and then frozen for the future test.
++            with torch.no_grad():
++                gaussians._scaling.add_(float(np.log(args.eval_gaussian_scale)))
++            print("Evaluation Gaussian scale multiplier:", args.eval_gaussian_scale)
++
++        if args.profile_resources:
++            print(f"PROFILE loaded_allocated_bytes={torch.cuda.memory_allocated()}")
++            print(f"PROFILE load_peak_bytes={torch.cuda.max_memory_allocated()}")
++            torch.cuda.reset_peak_memory_stats()
+         
+         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+@@ -254,7 +512,7 @@ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int
+             render_video(dataset.model_path, "video", first_iter, scene.getRenderCameras(), gaussians, 
+                         pipeline, background, opt, args, interpolation=args.interpolation)
+         else:
+-            eval_path = render_set(dataset.model_path, "test", first_iter, scene.getTestCameras(), gaussians, pipeline, background, opt, args)
++            eval_path, _ = render_set(dataset.model_path, "test", first_iter, scene.getTestCameras(), gaussians, pipeline, background, opt, args)
+             evaluate(eval_path, resize_ratio=args.resize)
+ 
+ if __name__ == "__main__":
+diff --git a/gaussian_renderer/__init__.py b/gaussian_renderer/__init__.py
+index 94c51da..abdf2b7 100644
+--- a/gaussian_renderer/__init__.py
++++ b/gaussian_renderer/__init__.py
+@@ -114,8 +114,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor,
+             "depth": depth,
+             "tidx": tidx}
+ 
+-def render_motion(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None,
+-                  xyz_t=None, r_t=None, opacity=None):
++def render_motion(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None,
++                  xyz_t=None, r_t=None, opacity=None, scales_t=None):
+     """
+     Render the scene. 
+     
+@@ -154,7 +154,7 @@ def render_motion(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
+     means3D = xyz_t
+     means2D = screenspace_points
+     rotations = r_t
+-    scales = pc.get_scaling
++    scales = pc.get_scaling if scales_t is None else scales_t
+ 
+     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+@@ -188,4 +188,4 @@ def render_motion(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.T
+     return {"render": rendered_image,
+             "viewspace_points": screenspace_points,
+             "visibility_filter" : radii > 0,
+-            "radii": radii}
+\ No newline at end of file
++            "radii": radii}
+diff --git a/metrics.py b/metrics.py
+index afe0f9f..7f03ab4 100644
+--- a/metrics.py
++++ b/metrics.py
+@@ -21,7 +21,22 @@ import json
+ from tqdm import tqdm
+ from utils.image_utils import psnr
+ from argparse import ArgumentParser
+-from pytorch_msssim import ms_ssim
++from pytorch_msssim import ms_ssim
++
++
++def _ms_ssim_at_native_resolution(render, gt):
++    """Evaluate MS-SSIM without changing the native image resolution.
++
++    The upstream default 11-pixel window requires both spatial dimensions to
++    exceed 160 pixels.  For smaller images, use the largest supported odd
++    window (7 for the 128x128 ManiSkill evaluation).  The paper-facing SSIM,
++    PSNR, and LPIPS computations are unchanged.
++    """
++    min_side = min(render.shape[-2:])
++    win_size = 11 if min_side > 160 else 7
++    return ms_ssim(
++        render, gt, data_range=1, size_average=True, win_size=win_size
++    )
+ 
+ def readImages(renders_dir, gt_dir, resize=False, resize_ratio=0.5):
+     renders = []
+@@ -72,7 +87,7 @@ def evaluate_twodir(gt_dir, renders_dir):
+             ssims.append(ssim(renders[idx], gts[idx]))
+             psnrs.append(psnr(renders[idx], gts[idx]))
+             lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+-            ms_ssims.append(ms_ssim(renders[idx], gts[idx],data_range=1, size_average=True ))
++            ms_ssims.append(_ms_ssim_at_native_resolution(renders[idx], gts[idx]))
+             lpipsa.append(lpips(renders[idx], gts[idx], net_type='alex'))
+             Dssims.append((1-ms_ssims[-1])/2)
+ 
+@@ -140,7 +155,7 @@ def evaluate(model_paths, resize=False, resize_ratio=0.5):
+                 ssims.append(ssim(renders[idx], gts[idx]))
+                 psnrs.append(psnr(renders[idx], gts[idx]))
+                 lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+-                ms_ssims.append(ms_ssim(renders[idx], gts[idx],data_range=1, size_average=True ))
++                ms_ssims.append(_ms_ssim_at_native_resolution(renders[idx], gts[idx]))
+                 lpipsa.append(lpips(renders[idx], gts[idx], net_type='alex'))
+                 Dssims.append((1-ms_ssims[-1])/2)
+                 error = (renders[idx] - gts[idx])[0].permute(1, 2, 0).abs().cpu().numpy()
+@@ -191,4 +206,4 @@ if __name__ == "__main__":
+     if args.split:
+         evaluate_twodir(args.gt_paths, args.model_paths[0])
+     else:
+-        evaluate(args.model_paths)
+\ No newline at end of file
++        evaluate(args.model_paths)
+diff --git a/motion_model/dataset.py b/motion_model/dataset.py
+index 2036c92..5e598ee 100644
+--- a/motion_model/dataset.py
++++ b/motion_model/dataset.py
+@@ -38,13 +38,26 @@ class GCNBaseDataset(data.Dataset, ABC):
+         self.val_id = dataset_json['val_ids']
+         self.all_time = [meta_json[i]['warp_id'] for i in self.all_img]
+ 
+-        max_time = max(self.all_time)
++        strict_prefix = bool(dataset_json.get('strict_prefix_no_test', False))
++        if strict_prefix:
++            if self.val_id:
++                raise RuntimeError('Strict-prefix motion data must have no val_ids')
++            if set(self.all_img) != set(dataset_json['train_ids']):
++                raise RuntimeError('Strict-prefix motion ids must equal train_ids')
++        max_time = int(dataset_json.get(
++            'time_normalization_max_warp', max(self.all_time)
++        ))
++        if max_time < max(self.all_time):
++            raise RuntimeError('Invalid strict-prefix time normalization maximum')
+         if self.max_time < 1.0:
+             self.all_time, self.i_train, self.i_test = [], [], []
+             for idx, i in enumerate(self.all_img):
+                 time = meta_json[i]['warp_id']/max_time
+                 self.all_time += [time]
+-                if len(self.val_id) == 0:
++                if strict_prefix:
++                    if time < self.max_time:
++                        self.i_train += [idx]
++                elif len(self.val_id) == 0:
+                     if idx % 4 ==0 and time < self.max_time:
+                         self.i_train += [idx]
+                     if (idx - 2) % 4 ==0 and time >= self.max_time:
+@@ -55,12 +68,13 @@ class GCNBaseDataset(data.Dataset, ABC):
+                         self.i_test.append(idx)
+                     if i in self.train_id and time < self.max_time:
+                         self.i_train.append(idx)
+-            self.i_test = np.array(self.i_test)
+-            self.i_train = np.array(self.i_train)
++            self.i_test = np.asarray(self.i_test, dtype=np.int64)
++            self.i_train = np.asarray(self.i_train, dtype=np.int64)
+             np_all_time = np.array(self.all_time)
+             test_time = np_all_time[self.i_test]
+             train_time = np_all_time[self.i_train]
+-            assert test_time.max() >= self.max_time
++            if not strict_prefix:
++                assert test_time.max() >= self.max_time
+             assert train_time.min() < self.max_time
+             print("train:", self.i_train)
+             print("test:", self.i_test)
+@@ -85,12 +99,20 @@ class GCNBaseDataset(data.Dataset, ABC):
+         train_file.close()
+ 
+     def load_times(self):
+-        if "d-nerf" in self.model_path or "white" in self.model_path:
++        # Detect the dataset from its required metadata instead of relying on
++        # experiment-directory naming conventions.  The upstream name check
++        # misclassifies valid D-NeRF runs whose model path lacks "d-nerf".
++        if os.path.isfile(os.path.join(self.source_path, "transforms_train.json")):
+             print("Find transforms_train.json file, assume it D-NeRF Dataset!")
+             self.load_dnerf_times()
+-        else:
++        elif (os.path.isfile(os.path.join(self.source_path, "metadata.json")) and
++              os.path.isfile(os.path.join(self.source_path, "dataset.json"))):
+             print("Find metadata.json file, assume it HyperNeRF Dataset!")
+             self.load_hyper_times()
++        else:
++            raise FileNotFoundError(
++                "Could not identify dataset metadata under {}".format(self.source_path)
++            )
+     
+     @abstractmethod
+     def get_lens(self):
+@@ -116,23 +138,54 @@ class GCNBaseDataset(data.Dataset, ABC):
+         self.kpts_xyz_motion_test, self.kpts_r_motion_test = [], []
+         for i in range(len(self.train_times)):
+             time_ = torch.tensor([self.train_times[i]], dtype=torch.float32).cuda()
+-            _, _, _, _ = self.gaussians(time_, self.iteration)
+-            kpts_xyz += [self.gaussians.get_superGaussians + self.gaussians.kpts_xyz_motion]
+-            kpts_r += [self.gaussians.kpts_rotation_motion]
+-            self.kpts_xyz_motion_train += [self.gaussians.kpts_xyz_motion]
+-            self.kpts_r_motion_train += [self.gaussians.kpts_rotation_motion]
++            delta_xyz, delta_q = self.gaussians.forward_keypoints(
++                time_, self.iteration
++            )
++            kpts_xyz += [self.gaussians.get_superGaussians + delta_xyz]
++            kpts_r += [delta_q]
++            self.kpts_xyz_motion_train += [delta_xyz]
++            self.kpts_r_motion_train += [delta_q]
+         self.kpts_xyz_train = torch.stack(kpts_xyz, dim=0)
+         self.kpts_r_train = torch.stack(kpts_r, dim=0)
++        # A training dataset consumes only the observed-prefix trajectories.
++        # The released implementation also evaluated every future time here,
++        # even though prepare_item(split="train") discards those tensors.  Skip
++        # that redundant evaluation exposure and preprocessing without changing
++        # any training example or loss.
++        if self.split == "train":
++            nodes = self.gaussians.super_gaussians.shape[0]
++            self.kpts_xyz_test = torch.empty(
++                (0, nodes, 3), dtype=self.kpts_xyz_train.dtype,
++                device=self.kpts_xyz_train.device,
++            )
++            self.kpts_r_test = torch.empty(
++                (0, nodes, 4), dtype=self.kpts_r_train.dtype,
++                device=self.kpts_r_train.device,
++            )
++            return
+         kpts_xyz, kpts_r = [], []
+         for i in range(len(self.test_times)):
+             time_ = torch.tensor([self.test_times[i]], dtype=torch.float32).cuda()
+-            _, _, _, _ = self.gaussians(time_, self.iteration)
+-            kpts_xyz += [self.gaussians.get_superGaussians + self.gaussians.kpts_xyz_motion]
+-            kpts_r += [self.gaussians.kpts_rotation_motion]
+-            self.kpts_xyz_motion_test += [self.gaussians.kpts_xyz_motion]
+-            self.kpts_r_motion_test += [self.gaussians.kpts_rotation_motion]
+-        self.kpts_xyz_test = torch.stack(kpts_xyz, dim=0)
+-        self.kpts_r_test = torch.stack(kpts_r, dim=0)
++            delta_xyz, delta_q = self.gaussians.forward_keypoints(
++                time_, self.iteration
++            )
++            kpts_xyz += [self.gaussians.get_superGaussians + delta_xyz]
++            kpts_r += [delta_q]
++            self.kpts_xyz_motion_test += [delta_xyz]
++            self.kpts_r_motion_test += [delta_q]
++        if kpts_xyz:
++            self.kpts_xyz_test = torch.stack(kpts_xyz, dim=0)
++            self.kpts_r_test = torch.stack(kpts_r, dim=0)
++        else:
++            nodes = self.gaussians.super_gaussians.shape[0]
++            self.kpts_xyz_test = torch.empty(
++                (0, nodes, 3), dtype=self.kpts_xyz_train.dtype,
++                device=self.kpts_xyz_train.device,
++            )
++            self.kpts_r_test = torch.empty(
++                (0, nodes, 4), dtype=self.kpts_r_train.dtype,
++                device=self.kpts_r_train.device,
++            )
+ 
+     def __len__(self):
+         if self.split == "train":
+diff --git a/options/gaussian_option.py b/options/gaussian_option.py
+index 63c41ca..820cfa0 100644
+--- a/options/gaussian_option.py
++++ b/options/gaussian_option.py
+@@ -13,6 +13,15 @@ class Gaussian_Options:
+         self.parser.add_argument("--render_video", action='store_true', default=False)
+         self.parser.add_argument("--train_view", nargs="+", type=int, default=[0])
+         self.parser.add_argument("--interpolation", type=int, default=5)
++        self.parser.add_argument("--compact_checkpoint", type=str, default=None)
++        self.parser.add_argument("--compile_compact_checkpoint", type=str, default=None)
++        self.parser.add_argument("--compact_inference", action='store_true', default=False)
++        self.parser.add_argument("--eval_tag", type=str, default="eval")
++        self.parser.add_argument("--profile_resources", action='store_true', default=False)
++        self.parser.add_argument("--eval_gaussian_scale", type=float, default=1.0,
++                                 help="Causally calibrated multiplier for Gaussian radii at evaluation")
++        self.parser.add_argument("--eval_motion_time", type=float, default=None,
++                                 help="Optional normalized motion time; camera and ground truth stay unchanged")
+     
+     def dynamic_training(self):
+         # Adaptive strategy
+@@ -43,6 +52,13 @@ class Gaussian_Options:
+         self.parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+         self.parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+         self.parser.add_argument("--start_checkpoint", type=str, default = None)
++        self.parser.add_argument("--birth_ply", type=str, default=None,
++                                 help="Causal RGB-D points to append when resuming")
++        self.parser.add_argument("--birth_time", type=float, default=0.0,
++                                 help="Normalized activation time for appended Gaussians")
++        self.parser.add_argument("--foreground_loss_weight", type=float, default=0.0,
++                                 help="Extra L1 weight on non-background target pixels")
++        self.parser.add_argument("--foreground_threshold", type=float, default=0.04)
+         self.parser.add_argument("--batch", type=int, default=1)
+         self.parser.add_argument("--max_gaussian_size", type=int, default=2e5)
+ 
+diff --git a/scene/dataset_readers.py b/scene/dataset_readers.py
+index 07f2487..d70797a 100644
+--- a/scene/dataset_readers.py
++++ b/scene/dataset_readers.py
+@@ -215,7 +215,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
+ 
+             norm_data = im_data / 255.0
+             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
++            # Pillow expects unsigned RGB samples.  ``np.byte`` is signed int8
++            # and can either fail or wrap values above 127 on current Pillow.
++            # This compatibility correction preserves the intended [0, 255]
++            # compositing and does not alter the model or training objective.
++            image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
+ 
+             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+             FovY = fovy 
+@@ -311,4 +315,4 @@ sceneLoadTypeCallbacks = {
+     "Colmap": readColmapSceneInfo,
+     "Blender" : readNerfSyntheticInfo,
+     "Hyper": readHyperDataInfos
+-}
+\ No newline at end of file
++}
+diff --git a/scene/gaussian_model.py b/scene/gaussian_model.py
+index 163b2dd..d5c094b 100644
+--- a/scene/gaussian_model.py
++++ b/scene/gaussian_model.py
+@@ -88,10 +88,16 @@ class GaussianModel(nn.Module):
+         self.second_stage_iter = self.args.second_stage_iteration # 30000
+         self.third_stage_iter = self.args.third_stage_iteration # 40000
+         self.second_stage = False
+-        self.third_stage = False
+-        self.nearest_mask = None
+-        self.setup_functions()
+-        self.new_kpts_init()
++        self.third_stage = False
++        self.nearest_mask = None
++        # Optional inference-only representation.  The learned binding network
++        # and FRNN query are constant after training, so they can be compiled
++        # into six sparse bindings per Gaussian without changing the model.
++        self.compact_nearest = None
++        self.compact_weights_xyz = None
++        self.compact_weights_r = None
++        self.setup_functions()
++        self.new_kpts_init()
+     
+     def restore(self, opt_dict, training_args, iteration=-1):
+         self.training_args = training_args
+@@ -211,7 +217,7 @@ class GaussianModel(nn.Module):
+         else:
+             self.new_xyz, self.new_motion_feature = None, None
+     
+-    def fill_nearest(self, weights, nearest_mask=None, weights_fill=None):
++    def fill_nearest(self, weights, nearest_mask=None, weights_fill=None):
+         nearest_mask = self.nearest_mask if nearest_mask is None else nearest_mask
+         weights_fill = self.weights_fill if weights_fill is None else weights_fill
+ 
+@@ -226,9 +232,91 @@ class GaussianModel(nn.Module):
+         weights_xyz = torch.scatter(weights_xyz_inputs, -1, nearest_mask, weights_xyz)
+         weights_r = torch.scatter(weights_r_inputs, -1, nearest_mask, weights_r)
+ 
+-        return weights_xyz, weights_r
+-    
+-    def forward(self, t, iteration, return_weights=False):
++        return weights_xyz, weights_r
++
++    @torch.no_grad()
++    def compile_sparse_bindings(self):
++        """Compile the frozen binding network into its exact local weights."""
++        if self.weights_model is None:
++            raise RuntimeError("The binding network is required for compilation")
++        weights = self.weights_model(self.get_xyz.detach())
++        self.get_nearest_mask(keepshape=True)
++        nearest = self.nearest_mask.to(torch.long)
++        k = self.args.nearest_num
++        self.compact_nearest = nearest.contiguous()
++        self.compact_weights_xyz = torch.softmax(weights[..., :k], dim=-1).contiguous()
++        self.compact_weights_r = torch.softmax(weights[..., k:2 * k], dim=-1).contiguous()
++
++    @torch.no_grad()
++    def load_sparse_bindings(self, bindings):
++        self.compact_nearest = bindings["nearest"].to(device="cuda", dtype=torch.long).contiguous()
++        self.compact_weights_xyz = bindings["weights_xyz"].to(device="cuda", dtype=torch.float32).contiguous()
++        self.compact_weights_r = bindings["weights_r"].to(device="cuda", dtype=torch.float32).contiguous()
++        expected = (self.get_xyz.shape[0], self.args.nearest_num)
++        if tuple(self.compact_nearest.shape) != expected:
++            raise RuntimeError(f"Compiled binding shape {tuple(self.compact_nearest.shape)} != {expected}")
++
++    def inference_setup(self, iteration):
++        """Set stage flags for rendering without allocating an Adam optimizer."""
++        self.second_stage = iteration > self.second_stage_iter
++        self.third_stage = iteration > self.third_stage_iter
++        self.optimizer = None
++
++    def compact_state_dict(self):
++        """State needed for exact rendering after sparse-binding compilation."""
++        state = {}
++        for name, value in self.state_dict().items():
++            if name == "weights_fill" or name.startswith("weights_model."):
++                continue
++            # Per-Gaussian motion features are only used by late opacity.
++            if name == "motion_feature" and not self.args.step_opacity:
++                continue
++            state[name] = value.detach().cpu()
++        return state
++
++    def sparse_bindings_state(self):
++        if self.compact_nearest is None:
++            raise RuntimeError("Sparse bindings have not been compiled")
++        return {
++            "nearest": self.compact_nearest.detach().to(device="cpu", dtype=torch.int32),
++            "weights_xyz": self.compact_weights_xyz.detach().cpu(),
++            "weights_r": self.compact_weights_r.detach().cpu(),
++        }
++
++    def forward_keypoints(self, t, iteration):
++        """Evaluate only the super-Gaussian motion consumed by forecasters.
++
++        The released ``forward`` computes these tensors and then blends them
++        back to every Gaussian for rendering.  Trajectory datasets discard that
++        rendered-Gaussian result, so avoid the exact unused blending operation.
++        """
++        if torch.is_tensor(iteration):
++            iteration = iteration.item()
++        if iteration <= self.second_stage_iter:
++            raise RuntimeError(
++                "Keypoint trajectories require iteration > second_stage_iteration"
++            )
++        encoded_t = positional_encoding(
++            t, self.time_input_dim // 2
++        ).unsqueeze(0)
++        decay = 1 - min(
++            1, (iteration - self.second_stage_iter) / self.args.xyz_noise_iteration
++        )
++        keypoint_noise = torch.randn_like(self.super_gaussians) * 0.1 * decay
++        xyz_embed = positional_encoding(
++            self.get_superGaussians + keypoint_noise,
++            int(self.xyz_input_dim / 6),
++        )
++        delta_xyz, delta_q, _ = self.get_motion_delta(
++            xyz_embed, self.super_gaussians_feature, encoded_t
++        )
++        if self.args.norm_rotation:
++            delta_q = self.rotation_activation(delta_q)
++        self.kpts_xyz_motion = delta_xyz
++        self.kpts_rotation_motion = delta_q
++        return delta_xyz, delta_q
++
++    def forward(self, t, iteration, return_weights=False):
+         t_input = t
+         t = (positional_encoding(t, self.time_input_dim // 2)).unsqueeze(0)
+         if torch.is_tensor(iteration):
+@@ -246,31 +334,40 @@ class GaussianModel(nn.Module):
+         if iteration == self.third_stage_iter + 1:
+             self.training3stage_setup()
+         # Setting second stage training
+-        if iteration == self.second_stage_iter + 1: 
+-            self.set_superKeypoints()
++        if iteration == self.second_stage_iter + 1 and not self.second_stage: 
++            self.set_superKeypoints()
+         # Second stage: extract key points and deform with those key points
+-        if iteration > self.second_stage_iter:
++        if iteration > self.second_stage_iter:
+             # decay_noise_gaussians = torch.randn_like(self.super_gaussians) * 0.1 * (2 - min(2, iteration / 20000)) # Best Now.
+             decay_noise_gaussians = torch.randn_like(self.super_gaussians) * 0.1 * (1 - min(1, (iteration - self.second_stage_iter) / self.args.xyz_noise_iteration))
+             xyz_embed = positional_encoding(self.get_superGaussians + decay_noise_gaussians , int(self.xyz_input_dim / 6))
+             motion_feature = self.super_gaussians_feature
+-            weights = self.weights_model(self.get_xyz.detach())
+-            
+-            # Nearest weights
+-            self.get_nearest_mask(keepshape=True)
+-            weights_xyz, weights_r = self.fill_nearest(weights)
+-                
+-            self.weights_sum = torch.abs(weights_xyz) + torch.abs(weights_r)
++            if self.compact_nearest is None:
++                weights = self.weights_model(self.get_xyz.detach())
++
++                # Nearest weights
++                self.get_nearest_mask(keepshape=True)
++                weights_xyz, weights_r = self.fill_nearest(weights)
++                self.weights_sum = torch.abs(weights_xyz) + torch.abs(weights_r)
++            else:
++                weights_xyz = self.compact_weights_xyz
++                weights_r = self.compact_weights_r
+ 
+         delta_xyz, delta_q, delta_o = self.get_motion_delta(xyz_embed, motion_feature, t)
+         if self.args.norm_rotation:
+             delta_q = self.rotation_activation(delta_q)
+ 
+         self.kpts_xyz_motion = delta_xyz
+-        self.kpts_rotation_motion = delta_q
+-        if iteration > self.second_stage_iter:
+-            delta_q = weights_r @ delta_q
+-            delta_xyz = weights_xyz @ delta_xyz
++        self.kpts_rotation_motion = delta_q
++        if iteration > self.second_stage_iter:
++            if self.compact_nearest is None:
++                delta_q = weights_r @ delta_q
++                delta_xyz = weights_xyz @ delta_xyz
++            else:
++                local_delta_q = delta_q[self.compact_nearest]
++                local_delta_xyz = delta_xyz[self.compact_nearest]
++                delta_q = torch.sum(weights_r.unsqueeze(-1) * local_delta_q, dim=1)
++                delta_xyz = torch.sum(weights_xyz.unsqueeze(-1) * local_delta_xyz, dim=1)
+ 
+             if self.args.densify_from_teaching:
+                 with torch.no_grad():
+@@ -296,11 +393,15 @@ class GaussianModel(nn.Module):
+             else:
+                 opacity = self.get_opacity * self.sharp_sigmoid(delta_o)
+             self.lifecycle_opacity = opacity
+-            if return_weights and iteration > self.second_stage_iter:
+-                return xyz, q, s, self.get_opacity, weights_xyz, weights_r
+-            return xyz, q, s, opacity
+-        if return_weights and iteration > self.second_stage_iter:
+-            return xyz, q, s, self.get_opacity, weights_xyz, weights_r
++            if return_weights and iteration > self.second_stage_iter:
++                if self.compact_nearest is not None:
++                    raise RuntimeError("Dense binding export is unavailable in compact inference mode")
++                return xyz, q, s, self.get_opacity, weights_xyz, weights_r
++            return xyz, q, s, opacity
++        if return_weights and iteration > self.second_stage_iter:
++            if self.compact_nearest is not None:
++                raise RuntimeError("Dense binding export is unavailable in compact inference mode")
++            return xyz, q, s, self.get_opacity, weights_xyz, weights_r
+         return xyz, q, s, self.get_opacity
+ 
+     def get_teach_motion(self, t, delta_xyz):
+@@ -359,7 +460,10 @@ class GaussianModel(nn.Module):
+             self.opacity_thres = nn.Parameter(-2 * torch.ones_like(opacities).requires_grad_(True))
+             delta_dim += 1
+ 
+-        self.motion_feature = nn.Parameter(1e-3 * (2 * torch.rand((self.N_pcd_init, self.motion_feature_dim)).cuda() - 1))
++        if getattr(self.args, "compact_inference", False) and not self.args.step_opacity:
++            self.motion_feature = nn.Parameter(torch.empty((0, 0), device="cuda"), requires_grad=False)
++        else:
++            self.motion_feature = nn.Parameter(1e-3 * (2 * torch.rand((self.N_pcd_init, self.motion_feature_dim)).cuda() - 1))
+         self.df_model = Deformable_Field(self.time_input_dim + self.xyz_input_dim + self.motion_feature_dim, d=self.d, w=self.w, output_dim=delta_dim, split_xyz=self.split_xyz).to('cuda')
+         if self.final_kpts_num is not None:
+             self.super_gaussians = nn.Parameter(torch.ones([self.final_kpts_num, 3], dtype=torch.float32).requires_grad_(True).to("cuda"))
+@@ -370,36 +474,100 @@ class GaussianModel(nn.Module):
+         k=2; L = 16; F = 4; log2_T = 19; N_min = 16
+         b = np.exp(np.log(2048/N_min)/(L-1))
+         print(f'GridEncoding: Nmin={N_min} b={b:.5f} F={F} T=2^{log2_T} L={L}')
+-        self.weights_model = tcnn.NetworkWithInputEncoding(
+-            n_input_dims=3, n_output_dims=k * self.args.nearest_num,
+-            encoding_config={
+-                "otype": "Grid",
+-                "type": "Hash",
+-                "n_levels": L,
+-                "n_features_per_level": F,
+-                "log2_hashmap_size": log2_T,
+-                "base_resolution": N_min,
+-                "per_level_scale": b,
+-                "interpolation": "Linear"
+-            },
+-            network_config={
+-                "otype": "FullyFusedMLP",
+-                "activation": "ReLU",
+-                "output_activation": "None",
+-                "n_neurons": 64,
+-                "n_hidden_layers": 2,
+-            }
+-        )
++        if getattr(self.args, "compact_inference", False):
++            self.weights_model = None
++        else:
++            self.weights_model = tcnn.NetworkWithInputEncoding(
++                n_input_dims=3, n_output_dims=k * self.args.nearest_num,
++                encoding_config={
++                    "otype": "Grid",
++                    "type": "Hash",
++                    "n_levels": L,
++                    "n_features_per_level": F,
++                    "log2_hashmap_size": log2_T,
++                    "base_resolution": N_min,
++                    "per_level_scale": b,
++                    "interpolation": "Linear"
++                },
++                network_config={
++                    "otype": "FullyFusedMLP",
++                    "activation": "ReLU",
++                    "output_activation": "None",
++                    "n_neurons": 64,
++                    "n_hidden_layers": 2,
++                }
++            )
+       
+-    def training3stage_setup(self):
+-        self.third_stage = True
++    @torch.no_grad()
++    def append_birth_points(self, ply_path, birth_time):
++        """Append causally observed RGB-D points as lifecycle-aware Gaussians."""
++        vertices = PlyData.read(ply_path)["vertex"]
++        xyz = np.vstack([vertices["x"], vertices["y"], vertices["z"]]).T
++        rgb = np.vstack([vertices["red"], vertices["green"], vertices["blue"]]).T / 255.0
++        if xyz.shape[0] == 0:
++            print("No causal Gaussian births found in", ply_path)
++            return
++
++        new_xyz = torch.tensor(xyz, dtype=torch.float32, device="cuda")
++        new_color = RGB2SH(torch.tensor(rgb, dtype=torch.float32, device="cuda"))
++        features = torch.zeros(
++            (new_xyz.shape[0], 3, (self.max_sh_degree + 1) ** 2),
++            dtype=torch.float32,
++            device="cuda",
++        )
++        features[:, :3, 0] = new_color
++        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
++        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()
++
++        if new_xyz.shape[0] > 1:
++            dist2 = torch.clamp_min(distCUDA2(new_xyz), 1.0e-7)
++        else:
++            dist2 = torch.full((1,), 1.0e-4, dtype=torch.float32, device="cuda")
++        new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
++        new_rotation = torch.zeros((new_xyz.shape[0], 4), device="cuda")
++        new_rotation[:, 0] = 1.0
++        new_opacity = inverse_sigmoid(
++            0.1 * torch.ones((new_xyz.shape[0], 1), dtype=torch.float32, device="cuda")
++        )
++
++        # New splats inherit the nearest pre-existing local motion descriptor;
++        # it remains trainable in stage three so lifecycle opacity can adapt.
++        _, nearest, _ = knn_points(new_xyz.unsqueeze(0), self._xyz.unsqueeze(0), K=1)
++        new_motion_feature = self.motion_feature[nearest.reshape(-1)].detach().clone()
++        new_opacity_thres = None
++        if self.args.step_opacity:
++            new_opacity_thres = torch.full(
++                (new_xyz.shape[0], 1), float(birth_time), dtype=torch.float32, device="cuda"
++            )
++
++        previous = self._xyz.shape[0]
++        self.densification_postfix(
++            new_xyz,
++            new_features_dc,
++            new_features_rest,
++            new_opacity,
++            new_scaling,
++            new_rotation,
++            new_motion_feature=new_motion_feature,
++            new_opacity_thres=new_opacity_thres,
++        )
++        print(
++            "Causal Gaussian birth: appended {} points at t={:.6f} ({} -> {})".format(
++                new_xyz.shape[0], float(birth_time), previous, self._xyz.shape[0]
++            )
++        )
++
++    def training3stage_setup(self):
++        self.second_stage = True
++        self.third_stage = True
+         self.weights_fill = torch.zeros([self._xyz.shape[0], self.args.max_points + self.args.adaptive_points_num], dtype=torch.float32).cuda()
+         l = [{'params': [self._xyz], 'lr': self.training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+             {'params': [self._features_dc], 'lr': self.training_args.feature_lr, "name": "f_dc"},
+             {'params': [self._features_rest], 'lr': self.training_args.feature_lr / 20.0, "name": "f_rest"},
+             {'params': [self._opacity], 'lr': self.training_args.opacity_lr, "name": "opacity"},
+             {'params': [self._scaling], 'lr': self.training_args.scaling_lr, "name": "scaling"},
+-            {'params': [self._rotation], 'lr': self.training_args.rotation_lr, "name": "rotation"},
++            {'params': [self._rotation], 'lr': self.training_args.rotation_lr, "name": "rotation"},
++            {'params': [self.motion_feature], 'lr': self.training_args.mfeature_lr, "name": "motion_feature"},
+             {'params': [self.super_gaussians], 'lr': self.training_args.kpts_lr, "name": "s_xyz"},
+             {'params': [self.super_gaussians_feature], 'lr': self.training_args.kpts_lr, "name": "s_motion_feature"},
+             {'params': self.weights_model.parameters(), 'lr': self.training_args.hash_lr, "name": "weight_mlp"},
+@@ -407,7 +575,7 @@ class GaussianModel(nn.Module):
+             ]
+         if self.args.step_opacity:
+             l.append({'params': [self.opacity_thres], 'lr': self.training_args.opacity_lr, "name": "opacity_thres"})
+-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
++        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+     
+     def training2stage_setup(self):
+         self.second_stage = True   
+@@ -417,7 +585,17 @@ class GaussianModel(nn.Module):
+         self.kpts_gradient_accum = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
+         self.kpts_gradient_accum_max = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
+         self.kpts_denom = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
+-        self.register_buffer("weights_fill", torch.zeros([self._xyz.shape[0], self.args.max_points + self.args.adaptive_points_num], dtype=torch.float32).cuda())
++        weights_fill = torch.zeros(
++            [self._xyz.shape[0], self.args.max_points + self.args.adaptive_points_num],
++            dtype=torch.float32,
++            device="cuda",
++        )
++        if "weights_fill" in self._buffers:
++            self.weights_fill = weights_fill
++        else:
++            if hasattr(self, "weights_fill"):
++                delattr(self, "weights_fill")
++            self.register_buffer("weights_fill", weights_fill)
+         
+         l = [
+             {'params': [self.super_gaussians], 'lr': self.training_args.kpts_lr, "name": "s_xyz"},
+@@ -579,10 +757,16 @@ class GaussianModel(nn.Module):
+             self.opacity_thres = optimizable_tensors["opacity_thres"] if "opacity_thres" in key else nn.Parameter(self.opacity_thres[valid_points_mask])
+ 
+         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+-        self.xyz_gradient_accum_max = self.xyz_gradient_accum_max[valid_points_mask]
+-
+-        self.denom = self.denom[valid_points_mask]
+-        self.max_radii2D = self.max_radii2D[valid_points_mask]
++        self.xyz_gradient_accum_max = self.xyz_gradient_accum_max[valid_points_mask]
++
++        self.denom = self.denom[valid_points_mask]
++        self.max_radii2D = self.max_radii2D[valid_points_mask]
++        if self.xyz_motion_accum.shape[0] == valid_points_mask.shape[0]:
++            self.xyz_motion_accum = self.xyz_motion_accum[valid_points_mask]
++            self.xyz_motion_accum_max = self.xyz_motion_accum_max[valid_points_mask]
++            self.motion_denom = self.motion_denom[valid_points_mask]
++        if self.weights_fill.shape[0] == valid_points_mask.shape[0]:
++            self.weights_fill = self.weights_fill[valid_points_mask]
+ 
+     def cat_tensors_to_optimizer(self, tensors_dict, use_No_prune=True):
+         optimizable_tensors = {}
+@@ -625,10 +809,15 @@ class GaussianModel(nn.Module):
+         self.kpts_gradient_accum_max = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
+         self.kpts_denom = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
+ 
+-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+-        self.xyz_gradient_accum_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
++        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.xyz_gradient_accum_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
++        self.weights_fill = torch.zeros(
++            [self._xyz.shape[0], self.args.max_points + self.args.adaptive_points_num],
++            dtype=torch.float32,
++            device="cuda",
++        )
+     
+     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation,
+                               new_motion_feature=None, new_opacity_thres=None):
+@@ -656,11 +845,22 @@ class GaussianModel(nn.Module):
+ 
+ 
+         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+-        self.xyz_gradient_accum_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+-
+-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
++        self.xyz_gradient_accum_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
++        self.xyz_motion_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.xyz_motion_accum_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.motion_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
++        self.kpts_gradient_accum = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
++        self.kpts_gradient_accum_max = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
++        self.kpts_denom = torch.zeros((self.super_gaussians.shape[0], 1), device="cuda")
++        self.weights_fill = torch.zeros(
++            [self._xyz.shape[0], self.args.max_points + self.args.adaptive_points_num],
++            dtype=torch.float32,
++            device="cuda",
++        )
++
++    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+         n_init_points = self.get_xyz.shape[0]
+         # Extract points that satisfy the gradient condition
+         padded_grad = torch.zeros((n_init_points), device="cuda")
+@@ -769,4 +969,4 @@ class GaussianModel(nn.Module):
+             grad = torch.norm(viewspace_point_tensor.grad, dim=-1, keepdim=True)
+             self.kpts_gradient_accum += grad
+             self.kpts_gradient_accum_max = torch.where(grad > self.kpts_gradient_accum_max, grad, self.kpts_gradient_accum_max)
+-            self.kpts_denom += 1
+\ No newline at end of file
++            self.kpts_denom += 1
+diff --git a/scene/hyper_loader.py b/scene/hyper_loader.py
+index 1dafc08..01a218f 100644
+--- a/scene/hyper_loader.py
++++ b/scene/hyper_loader.py
+@@ -58,7 +58,16 @@ class Load_hyper_data(Dataset):
+         self.all_img = dataset_json['ids']
+         self.val_id = dataset_json['val_ids']
+         self.split = split
+-        if len(self.val_id) == 0:
++        strict_prefix = bool(dataset_json.get('strict_prefix_no_test', False))
++        if strict_prefix:
++            self.train_id = dataset_json['train_ids']
++            if set(self.all_img) != set(self.train_id):
++                raise RuntimeError('Strict-prefix ids must equal train_ids')
++            if self.val_id:
++                raise RuntimeError('Strict-prefix dataset must have no val_ids')
++            self.i_train = np.arange(len(self.all_img))
++            self.i_test = np.array([], dtype=np.int64)
++        elif len(self.val_id) == 0:
+             self.i_train = np.array([i for i in np.arange(len(self.all_img)) if
+                             (i%4 == 0)])
+             self.i_test = self.i_train + 2
+@@ -77,13 +86,18 @@ class Load_hyper_data(Dataset):
+ 
+         self.all_cam = [meta_json[i]['camera_id'] for i in self.all_img]
+         self.all_time = [meta_json[i]['warp_id'] for i in self.all_img]
+-        max_time = max(self.all_time)
++        max_time = int(dataset_json.get('time_normalization_max_warp', max(self.all_time)))
++        if max_time < max(self.all_time):
++            raise RuntimeError('Invalid time normalization maximum')
+         if thres_time < 1.0:
+             self.all_time, self.i_train, self.i_test = [], [], []
+             for idx, i in enumerate(self.all_img):
+                 time = meta_json[i]['warp_id']/max_time
+                 self.all_time += [time]
+-                if len(self.val_id) == 0:
++                if strict_prefix:
++                    if time < thres_time:
++                        self.i_train += [idx]
++                elif len(self.val_id) == 0:
+                     if idx % 4 ==0 and time < thres_time:
+                         self.i_train += [idx]
+                     if (idx - 2) % 4 ==0 and time >= thres_time:
+@@ -93,12 +107,13 @@ class Load_hyper_data(Dataset):
+                         self.i_test.append(idx)
+                     if i in self.train_id and time < thres_time:
+                         self.i_train.append(idx)
+-            self.i_test = np.array(self.i_test)
+-            self.i_train = np.array(self.i_train)
++            self.i_test = np.asarray(self.i_test, dtype=np.int64)
++            self.i_train = np.asarray(self.i_train, dtype=np.int64)
+             np_all_time = np.array(self.all_time)
+             test_time = np_all_time[self.i_test]
+             train_time = np_all_time[self.i_train]
+-            assert test_time.max() >= thres_time
++            if not strict_prefix:
++                assert test_time.max() >= thres_time
+             assert train_time.min() < thres_time
+             print("train:", self.i_train)
+             print("test:", self.i_test)
+diff --git a/train.py b/train.py
+index 705842f..8397489 100644
+--- a/train.py
++++ b/train.py
+@@ -54,7 +54,12 @@ def training(dataset, opt, pipe, args, batch):
+     gaussians.training_setup(opt)
+     if args.start_checkpoint:
+         gaussians.restore(opt_dict, opt, first_iter)
++        # This is a derived scratch buffer. Its shape legitimately changes
++        # when causal Gaussian births or adaptive keypoints are enabled.
++        model_params.pop("weights_fill", None)
+         gaussians.load_state_dict(model_params, strict=False)
++        if args.birth_ply:
++            gaussians.append_birth_points(args.birth_ply, args.birth_time)
+ 
+     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+@@ -103,7 +108,15 @@ def training(dataset, opt, pipe, args, batch):
+ 
+         # Loss
+         gt_image = viewpoint_cam.original_image.cuda()
+-        Ll1 = l1_loss(image, gt_image)
++        if args.foreground_loss_weight > 0:
++            foreground = torch.max(torch.abs(gt_image - background[:, None, None]), dim=0, keepdim=True).values
++            foreground = (foreground > args.foreground_threshold).to(gt_image.dtype)
++            pixel_weight = 1.0 + args.foreground_loss_weight * foreground
++            Ll1 = (torch.abs(image - gt_image) * pixel_weight).sum() / (
++                gt_image.shape[0] * pixel_weight.sum()
++            )
++        else:
++            Ll1 = l1_loss(image, gt_image)
+         psnr_ = psnr(image, gt_image).mean().double()
+         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+ 
+@@ -180,7 +193,8 @@ def training(dataset, opt, pipe, args, batch):
+ 
+             if iteration < args.adaptive_end_iter + gaussians.second_stage_iter and gaussians.super_gaussians.shape[0] < args.max_points + args.adaptive_points_num:
+                 # We use the first stage teach 
+-                if gaussians.second_stage:
++                if (gaussians.second_stage and args.densify_from_grad == "True"
++                        and gaussians.max_radii2D.shape[0] == visibility_filter.shape[0]):
+                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                 if iteration > args.adaptive_from_iter + gaussians.second_stage_iter and iteration % args.adaptive_interval == 0:
+diff --git a/train_GCN.py b/train_GCN.py
+index ce23210..8190edf 100644
+--- a/train_GCN.py
++++ b/train_GCN.py
+@@ -56,8 +56,10 @@ def train_gcn(args, opt, gaussians, scene, pipeline, background, iteration=60000
+     with torch.no_grad():
+         train_dataset = GCN3DDataset(gaussians, opt.time_freq, iteration=iteration, model_path=args.model_path, source_path=args.source_path,
+                                     max_time=args.max_time, input_size=args.input_size, output_size=args.output_size, split="train")
+-        test_dataset = GCN3DDataset(gaussians, opt.time_freq, iteration=iteration, model_path=args.model_path, source_path=args.source_path,
+-                                    max_time=args.max_time, input_size=args.input_size, output_size=args.output_size, split="test")
++        test_dataset = None
++        if not args.strict_fit_no_future_views:
++            test_dataset = GCN3DDataset(gaussians, opt.time_freq, iteration=iteration, model_path=args.model_path, source_path=args.source_path,
++                                        max_time=args.max_time, input_size=args.input_size, output_size=args.output_size, split="test")
+     trainLoarder = torch.utils.data.DataLoader(train_dataset,
+                                                 batch_size=args.batch_size,
+                                                 shuffle=True,
+@@ -113,6 +115,10 @@ def train_gcn(args, opt, gaussians, scene, pipeline, background, iteration=60000
+         os.makedirs(os.path.join(args.model_path, args.exp_name), exist_ok=True)
+         torch.save(model.state_dict(), os.path.join(args.model_path, args.exp_name, "ckpt.pth"))
+ 
++    if args.strict_fit_no_future_views:
++        print("STRICT_GCN_FIT_ONLY=PASS future_trajectory_samples_loaded=0")
++        return
++
+     batch = test_dataset[0]
+     for key in batch.keys():
+         if isinstance(batch[key], torch.Tensor):
+@@ -191,6 +197,7 @@ if __name__ == "__main__":
+     parser.add_argument("--skip_train", action="store_true")
+     parser.add_argument("--skip_test", action="store_true")
+     parser.add_argument("--quiet", action="store_true")
++    parser.add_argument("--strict_fit_no_future_views", action="store_true")
+ 
+     parser_options = Gaussian_Options(parser)
+     parser_options.initial()
+@@ -201,6 +208,14 @@ if __name__ == "__main__":
+     args.dct_n = args.input_size + args.output_size
+     print("Training GCN " + args.model_path)
+ 
++    # Match train.py's declared scene seed so the forecasting stage is also
++    # reproducible.  The released script exposes --seed through
++    # Gaussian_Options but did not apply it before constructing the GCN.
++    seed = 2024 * args.seed
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++
+     # Prepare Gaussian model
+     dataset = model.extract(args)
+     opt = op.extract(args)
+@@ -222,6 +237,11 @@ if __name__ == "__main__":
+     scene = Scene(dataset, gaussians, shuffle=False)
+     gaussians.restore(opt_dict, opt, first_iter)
+     gaussians.load_state_dict(model_params, strict=False)
++    # The representation is frozen while trajectories are extracted.  Its
++    # Gaussian-to-keypoint binding network is also frozen, so compile the exact
++    # local weights once instead of repeating FRNN and the hash MLP at every
++    # observed time.  This is algebraically identical to the released forward.
++    gaussians.compile_sparse_bindings()
+ 
+     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+diff --git a/utils/prepare/hypernerf2colmap.py b/utils/prepare/hypernerf2colmap.py
+index 4117e05..c1e8a8d 100644
+--- a/utils/prepare/hypernerf2colmap.py
++++ b/utils/prepare/hypernerf2colmap.py
+@@ -1,7 +1,10 @@
+ 
+ import os
+ import numpy as np
+-from ipdb import set_trace
++try:
++    from ipdb import set_trace
++except ImportError:
++    set_trace = breakpoint
+ import sys
+ import json
+ from PIL import Image
+diff --git a/utils/visualizer_utils.py b/utils/visualizer_utils.py
+index 1be950a..93ff478 100644
+--- a/utils/visualizer_utils.py
++++ b/utils/visualizer_utils.py
+@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
+ from sklearn.decomposition import PCA
+ from sklearn.cluster import KMeans, MeanShift
+ import trimesh
+-from kmeans_pytorch import kmeans
++from kmeans_pytorch import initialize, pairwise_distance
+ from torch_scatter import scatter
+ import open3d as o3d
+ 
+@@ -81,8 +81,43 @@ def PCA_vis(xyzs, features, output_path="default.ply", dim=3, return_only=False,
+     if finish_return:
+         return xyzs, vis_feature
+ 
++def _bounded_kmeans(features, clusters, tol=1e-4, max_iterations=300):
++    """Match kmeans_pytorch's Euclidean update with a finite safety cap.
++
++    The upstream implementation uses ``while True`` and can oscillate forever
++    on large GaussianPrediction point sets.  Keep its initialization, distance,
++    tolerance and Lloyd update, but make termination deterministic.
++    """
++    values = features.float().to(features.device)
++    centers = initialize(values, clusters)
++    assignments = None
++    center_shift_sq = float("inf")
++    for iteration in range(1, max_iterations + 1):
++        distances = pairwise_distance(values, centers)
++        assignments = torch.argmin(distances, dim=1)
++        previous = centers.clone()
++        for index in range(clusters):
++            selected = torch.nonzero(assignments == index).squeeze().to(values.device)
++            if selected.numel() > 0:
++                centers[index] = torch.index_select(values, 0, selected).mean(dim=0)
++        center_shift_sq = torch.sum(
++            torch.sqrt(torch.sum((centers - previous) ** 2, dim=1))
++        ).pow(2).item()
++        if center_shift_sq < tol:
++            break
++    print(
++        "bounded k-means: iterations={} center_shift={:.6f} tol={:.6f}{}".format(
++            iteration,
++            center_shift_sq,
++            tol,
++            " (cap reached)" if iteration == max_iterations and center_shift_sq >= tol else "",
++        )
++    )
++    return assignments.cpu(), centers.cpu()
++
++
+ def feature_kmeans(xyzs, features, K=10, vis=False, return_idx=False):
+-    cluster_ids_x, cluster_centers = kmeans(X=features, num_clusters=K, device=features.device)
++    cluster_ids_x, cluster_centers = _bounded_kmeans(features, K)
+     xyzs_means = scatter(xyzs, cluster_ids_x.to(xyzs.device), dim=0, reduce="mean")
+ 
+     if vis:
+@@ -134,4 +169,4 @@ def draw_trajectory(pcd, start_xyz, final_xyz):
+     point_cloud.points = o3d.utility.Vector3dVector(points)
+     point_cloud.colors = o3d.utility.Vector3dVector(colors)
+     o3d.visualization.draw_geometries([point_cloud])
+-            
+\ No newline at end of file
++            
