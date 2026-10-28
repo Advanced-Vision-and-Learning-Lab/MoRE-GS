@@ -49,7 +49,6 @@ MoRE-GS/
 ├── docs/                    protocol, data layout, results, provenance
 ├── moregs/                  experts, grouping, routing, and evaluation
 ├── patches/                 pinned GaussianPrediction compatibility patch
-├── results/                 documentation for generated summaries
 ├── scripts/                 setup, preparation, run, and validation tools
 ├── CITATION.cff
 ├── environment.yml
